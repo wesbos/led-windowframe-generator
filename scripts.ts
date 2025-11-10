@@ -1,8 +1,12 @@
+import { generateJigOpenSCAD, downloadOpenSCAD } from './jig-generator.js';
+
 interface FrameParams {
   windowWidth: number;
   windowHeight: number;
   idealSpacing: number;
   holeDiameter: number; // in mm
+  archedTop: boolean;
+  archHeight: number; // in inches
 }
 
 interface SavedConfig {
@@ -19,7 +23,16 @@ interface SideCalculation {
 interface FrameCalculations {
   horizontal: SideCalculation;
   vertical: SideCalculation;
+  arch?: ArchCalculation;
   totalLeds: number;
+}
+
+interface ArchCalculation {
+  radius: number;
+  numLeds: number;
+  arcLength: number;
+  actualSpacing: number;
+  cornerAngle: number; // in degrees
 }
 
 const CORNER_SIZE = 1; // 1 inch corner pieces
@@ -102,16 +115,63 @@ function calculateSide(length: number, idealSpacing: number): SideCalculation {
   };
 }
 
+function calculateArch(width: number, archHeight: number, idealSpacing: number): ArchCalculation {
+  // Calculate radius of circular arc using the formula for a circular segment
+  // r = (c²/4 + h²) / (2h)
+  // where c = chord length (width), h = sagitta (arch height)
+
+  const chord = width - CORNER_SIZE; // Distance between corner centers
+  const sagitta = archHeight;
+
+  const radius = (Math.pow(chord, 2) / 4 + Math.pow(sagitta, 2)) / (2 * sagitta);
+
+  // Calculate the central angle (in radians) using the relationship:
+  // sin(θ/2) = (c/2) / r
+  const halfAngle = Math.asin((chord / 2) / radius);
+  const centralAngle = halfAngle * 2;
+
+  // Arc length
+  const arcLength = radius * centralAngle;
+
+  // Calculate number of LEDs and spacing along the arc
+  const numSegments = Math.round(arcLength / idealSpacing);
+  const actualSegments = Math.max(1, numSegments);
+  const actualSpacing = arcLength / actualSegments;
+  const numLeds = actualSegments + 1; // includes both ends
+
+  // Calculate corner angle (angle between vertical side and the tangent to the arc at the corner)
+  // This is the angle the corner piece needs to be cut at
+  const cornerAngle = 90 - (halfAngle * 180 / Math.PI); // Convert to degrees
+
+  return {
+    radius,
+    numLeds,
+    arcLength,
+    actualSpacing,
+    cornerAngle
+  };
+}
+
 function calculateFrame(params: FrameParams): FrameCalculations {
   const horizontal = calculateSide(params.windowWidth, params.idealSpacing);
   const vertical = calculateSide(params.windowHeight, params.idealSpacing);
 
-  // Total LEDs = top + bottom + left + right - 4 corners (counted twice)
-  const totalLeds = (horizontal.numLeds * 2) + (vertical.numLeds * 2) - 4;
+  let arch: ArchCalculation | undefined;
+  let totalLeds: number;
+
+  if (params.archedTop) {
+    arch = calculateArch(params.windowWidth, params.archHeight, params.idealSpacing);
+    // Total LEDs = arch + bottom + left + right - 4 corners (counted twice)
+    totalLeds = arch.numLeds + horizontal.numLeds + (vertical.numLeds * 2) - 4;
+  } else {
+    // Total LEDs = top + bottom + left + right - 4 corners (counted twice)
+    totalLeds = (horizontal.numLeds * 2) + (vertical.numLeds * 2) - 4;
+  }
 
   return {
     horizontal,
     vertical,
+    arch,
     totalLeds
   };
 }
@@ -123,23 +183,148 @@ function updateResults(params: FrameParams, calculations: FrameCalculations) {
   const formatSpacing = (inches: number): string => {
     const fraction = decimalToFraction(inches);
     const mm = inches * inchToMm;
-    return `${fraction}" / ${mm.toFixed(2)}mm`;
+    return `${fraction}" / ${mm.toFixed(1)}mm`;
   };
 
-  // Update statistics
-  document.getElementById('topLeds')!.textContent = calculations.horizontal.numLeds.toString();
-  document.getElementById('topSpacing')!.textContent = formatSpacing(calculations.horizontal.actualSpacing);
+  // Helper to create a side section
+  const createSideSection = (title: string, leds: number, spacing: number, length: number, pipeCut: number): string => {
+    return `
+      <div class="side-section">
+        <h3>${title}</h3>
+        <div class="side-stats">
+          <div class="stat-row">
+            <span class="stat-label">LEDs:</span>
+            <span class="stat-value">${leds}</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Spacing:</span>
+            <span class="stat-value stat-dual">${formatSpacing(spacing)}</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Length:</span>
+            <span class="stat-value stat-dual">${formatSpacing(length)}</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Pipe Cut:</span>
+            <span class="stat-value stat-dual">${formatSpacing(pipeCut)}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  };
 
-  document.getElementById('bottomLeds')!.textContent = calculations.horizontal.numLeds.toString();
-  document.getElementById('bottomSpacing')!.textContent = formatSpacing(calculations.horizontal.actualSpacing);
+  const container = document.getElementById('statsContainer')!;
 
-  document.getElementById('leftLeds')!.textContent = calculations.vertical.numLeds.toString();
-  document.getElementById('leftSpacing')!.textContent = formatSpacing(calculations.vertical.actualSpacing);
+  if (params.archedTop && calculations.arch) {
+    // Show separate sections for arch top
+    const archPipeCut = calculations.arch.arcLength - (2 * CORNER_SIZE);
+    const bottomPipeCut = params.windowWidth - (2 * CORNER_SIZE);
+    const sidePipeCut = params.windowHeight - (2 * CORNER_SIZE);
 
-  document.getElementById('rightLeds')!.textContent = calculations.vertical.numLeds.toString();
-  document.getElementById('rightSpacing')!.textContent = formatSpacing(calculations.vertical.actualSpacing);
+    container.innerHTML = `
+      ${createSideSection('Top Arch', calculations.arch.numLeds, calculations.arch.actualSpacing, calculations.arch.arcLength, archPipeCut)}
+      ${createSideSection('Bottom', calculations.horizontal.numLeds, calculations.horizontal.actualSpacing, params.windowWidth, bottomPipeCut)}
+      ${createSideSection('Left', calculations.vertical.numLeds, calculations.vertical.actualSpacing, params.windowHeight, sidePipeCut)}
+      ${createSideSection('Right', calculations.vertical.numLeds, calculations.vertical.actualSpacing, params.windowHeight, sidePipeCut)}
+    `;
+
+    // Show corner angle info
+    document.getElementById('cornerAngleInfo')!.style.display = 'block';
+    document.getElementById('cornerAngle')!.textContent = `${calculations.arch.cornerAngle.toFixed(1)}°`;
+
+    // Calculate and display arch pipe length
+    const archLengthFraction = decimalToFraction(calculations.arch.arcLength);
+    const archLengthMm = calculations.arch.arcLength * inchToMm;
+    document.getElementById('archPipeLength')!.textContent = `${archLengthFraction}" / ${archLengthMm.toFixed(2)}mm`;
+  } else {
+    // Group top/bottom and left/right together
+    const horizontalPipeCut = params.windowWidth - (2 * CORNER_SIZE);
+    const verticalPipeCut = params.windowHeight - (2 * CORNER_SIZE);
+
+    container.innerHTML = `
+      ${createSideSection('Top / Bottom', calculations.horizontal.numLeds, calculations.horizontal.actualSpacing, params.windowWidth, horizontalPipeCut)}
+      ${createSideSection('Left / Right', calculations.vertical.numLeds, calculations.vertical.actualSpacing, params.windowHeight, verticalPipeCut)}
+    `;
+
+    // Hide corner angle info
+    document.getElementById('cornerAngleInfo')!.style.display = 'none';
+  }
 
   document.getElementById('totalLeds')!.textContent = calculations.totalLeds.toString();
+
+  // Update jig download buttons
+  updateJigButtons(params, calculations);
+}
+
+function updateJigButtons(params: FrameParams, calculations: FrameCalculations) {
+  const container = document.getElementById('jigButtons');
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  const jigs: Array<{name: string, spacing: number, label: string}> = [];
+
+  // Add horizontal jig (top/bottom)
+  if (calculations.horizontal.numLeds > 1) {
+    jigs.push({
+      name: 'Horizontal',
+      spacing: calculations.horizontal.actualSpacing,
+      label: 'Top/Bottom'
+    });
+  }
+
+  // Add vertical jig (left/right)
+  if (calculations.vertical.numLeds > 1) {
+    jigs.push({
+      name: 'Vertical',
+      spacing: calculations.vertical.actualSpacing,
+      label: 'Left/Right'
+    });
+  }
+
+  // Add arch jig if applicable
+  if (params.archedTop && calculations.arch && calculations.arch.numLeds > 1) {
+    jigs.push({
+      name: 'Arch',
+      spacing: calculations.arch.actualSpacing,
+      label: 'Arch'
+    });
+  }
+
+  // Create unique jigs (in case horizontal and vertical are the same)
+  const uniqueJigs: {[key: string]: typeof jigs[0]} = {};
+  jigs.forEach(jig => {
+    const key = jig.spacing.toFixed(4);
+    if (!uniqueJigs[key]) {
+      uniqueJigs[key] = jig;
+    } else {
+      // Combine labels if spacing is the same
+      uniqueJigs[key].label += '/' + jig.label;
+    }
+  });
+
+  // Create buttons for each unique jig
+  for (const key in uniqueJigs) {
+    const jig = uniqueJigs[key];
+    const button = document.createElement('button');
+    button.className = 'btn-jig';
+
+    const spacingFraction = decimalToFraction(jig.spacing);
+    const spacingMm = jig.spacing * 25.4;
+
+    button.innerHTML = `
+      <div class="jig-label">${jig.label} Jig</div>
+      <div class="jig-spacing">${spacingFraction}" (${spacingMm.toFixed(2)}mm)</div>
+    `;
+
+    button.addEventListener('click', () => {
+      const scad = generateJigOpenSCAD(jig.spacing, `${jig.label} Jig`);
+      const filename = `LED_Jig_${jig.label.replace(/\//g, '_')}_${spacingFraction.replace(/[^0-9]/g, '_')}_${spacingMm.toFixed(1)}mm.scad`;
+      downloadOpenSCAD(scad, filename);
+    });
+
+    container.appendChild(button);
+  }
 }
 
 function setupLEDPositions(params: FrameParams, calculations: FrameCalculations, scale: number, offsetX: number, offsetY: number, cornerSize: number) {
@@ -153,18 +338,55 @@ function setupLEDPositions(params: FrameParams, calculations: FrameCalculations,
   const startY = offsetY + cornerSize / 2;
   const rightX = offsetX + params.windowWidth * scale - cornerSize / 2;
 
-  // Top side LEDs
-  for (let i = 0; i < calculations.horizontal.numLeds; i++) {
-    const x = startX + (i * calculations.horizontal.actualSpacing * scale);
-    ledPositions.push({
-      x,
-      y: topY,
-      color: C9_COLORS[colorIndex % C9_COLORS.length],
-      brightness: 1,
-      twinkleSpeed: 0.5 + Math.random() * 1.5,
-      twinkleOffset: Math.random() * Math.PI * 2
-    });
-    colorIndex++;
+  // Top side LEDs (or arch)
+  if (params.archedTop && calculations.arch) {
+    const arch = calculations.arch;
+    const chord = params.windowWidth - CORNER_SIZE;
+    const centerX = offsetX + params.windowWidth * scale / 2;
+
+    // The top of the rectangular part is at offsetY
+    const rectTopY = offsetY;
+
+    // Calculate the center of the circle for the arch
+    const centerY = rectTopY + (arch.radius - params.archHeight) * scale;
+
+    // Calculate the start and end angles
+    const halfAngle = Math.asin((chord / 2) / arch.radius);
+    const startAngle = Math.PI / 2 + halfAngle; // Left corner
+    const endAngle = Math.PI / 2 - halfAngle;   // Right corner
+
+    // Place LEDs along the arc (going from left to right)
+    for (let i = 0; i < arch.numLeds; i++) {
+      const t = i / (arch.numLeds - 1); // 0 to 1
+      // Interpolate angle from startAngle to endAngle
+      const angle = startAngle + t * (endAngle - startAngle);
+      const x = centerX + arch.radius * scale * Math.cos(angle);
+      const y = centerY - arch.radius * scale * Math.sin(angle);
+
+      ledPositions.push({
+        x,
+        y,
+        color: C9_COLORS[colorIndex % C9_COLORS.length],
+        brightness: 1,
+        twinkleSpeed: 0.5 + Math.random() * 1.5,
+        twinkleOffset: Math.random() * Math.PI * 2
+      });
+      colorIndex++;
+    }
+  } else {
+    // Straight top
+    for (let i = 0; i < calculations.horizontal.numLeds; i++) {
+      const x = startX + (i * calculations.horizontal.actualSpacing * scale);
+      ledPositions.push({
+        x,
+        y: topY,
+        color: C9_COLORS[colorIndex % C9_COLORS.length],
+        brightness: 1,
+        twinkleSpeed: 0.5 + Math.random() * 1.5,
+        twinkleOffset: Math.random() * Math.PI * 2
+      });
+      colorIndex++;
+    }
   }
 
   // Right side LEDs (excluding top-right corner)
@@ -219,9 +441,12 @@ function drawFrame(params: FrameParams, calculations: FrameCalculations, timesta
   const maxCanvasWidth = canvas.parentElement!.clientWidth - 40;
   const maxCanvasHeight = 600;
 
+  // Calculate total height including arch if present
+  const totalHeight = params.archedTop ? params.windowHeight + params.archHeight : params.windowHeight;
+
   // Calculate scale to fit canvas
   const scaleX = maxCanvasWidth / (params.windowWidth + 4);
-  const scaleY = maxCanvasHeight / (params.windowHeight + 4);
+  const scaleY = maxCanvasHeight / (totalHeight + 4);
   const scale = Math.min(scaleX, scaleY);
 
   // Update scale info (only once)
@@ -231,7 +456,7 @@ function drawFrame(params: FrameParams, calculations: FrameCalculations, timesta
 
   // Canvas dimensions
   const canvasWidth = (params.windowWidth + 4) * scale;
-  const canvasHeight = (params.windowHeight + 4) * scale;
+  const canvasHeight = (totalHeight + 4) * scale;
 
   canvas.width = canvasWidth;
   canvas.height = canvasHeight;
@@ -240,19 +465,64 @@ function drawFrame(params: FrameParams, calculations: FrameCalculations, timesta
   ctx.fillStyle = '#1a1a2e';
   ctx.fillRect(0, 0, canvasWidth, canvasHeight);
 
-  // Center the frame
+  // Center the frame - adjust Y offset if arched to make room for arch at top
   const offsetX = 2 * scale;
-  const offsetY = 2 * scale;
+  const offsetY = params.archedTop ? (2 + params.archHeight) * scale : 2 * scale;
 
   // Draw frame outline
   ctx.strokeStyle = '#34495e';
   ctx.lineWidth = 2;
-  ctx.strokeRect(
-    offsetX,
-    offsetY,
-    params.windowWidth * scale,
-    params.windowHeight * scale
-  );
+
+  if (params.archedTop && calculations.arch) {
+    const arch = calculations.arch;
+    const chord = params.windowWidth - CORNER_SIZE;
+    const centerX = offsetX + params.windowWidth * scale / 2;
+
+    // The top of the rectangular part
+    const rectTopY = offsetY;
+
+    // Calculate center of circle for the arch
+    // The center is BELOW the top of the arch (since we're drawing the top part of a circle)
+    const centerY = rectTopY - (arch.radius - params.archHeight) * scale;
+
+    const halfAngle = Math.asin((chord / 2) / arch.radius);
+
+    // For an arch at the top, we want angles in the lower hemisphere
+    // 270 degrees (3π/2) is pointing down
+    const startAngle = (3 * Math.PI / 2) - halfAngle; // Left corner
+    const endAngle = (3 * Math.PI / 2) + halfAngle;   // Right corner
+
+    // Draw left side
+    ctx.beginPath();
+    ctx.moveTo(offsetX, rectTopY);
+    ctx.lineTo(offsetX, offsetY + params.windowHeight * scale);
+    ctx.stroke();
+
+    // Draw bottom
+    ctx.beginPath();
+    ctx.moveTo(offsetX, offsetY + params.windowHeight * scale);
+    ctx.lineTo(offsetX + params.windowWidth * scale, offsetY + params.windowHeight * scale);
+    ctx.stroke();
+
+    // Draw right side
+    ctx.beginPath();
+    ctx.moveTo(offsetX + params.windowWidth * scale, offsetY + params.windowHeight * scale);
+    ctx.lineTo(offsetX + params.windowWidth * scale, rectTopY);
+    ctx.stroke();
+
+    // Draw arched top
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, arch.radius * scale, startAngle, endAngle);
+    ctx.stroke();
+  } else {
+    // Draw rectangular frame
+    ctx.strokeRect(
+      offsetX,
+      offsetY,
+      params.windowWidth * scale,
+      params.windowHeight * scale
+    );
+  }
 
   // Convert hole diameter from mm to inches (1 inch = 25.4mm)
   const holeDiameterInches = params.holeDiameter / 25.4;
@@ -315,94 +585,223 @@ function drawFrame(params: FrameParams, calculations: FrameCalculations, timesta
     ctx.stroke();
   });
 
-  // Draw spacing indicators on top side
+  // Helper function to draw text with background
+  const drawTextWithBackground = (text: string, x: number, y: number, fontSize: number = 16) => {
+    ctx.font = `bold ${fontSize}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    const metrics = ctx.measureText(text);
+    const textWidth = metrics.width;
+    const textHeight = fontSize;
+    const padding = 6;
+
+    // Draw background
+    ctx.fillStyle = 'rgba(26, 26, 46, 0.95)';
+    ctx.fillRect(
+      x - textWidth / 2 - padding,
+      y - textHeight / 2 - padding / 2,
+      textWidth + padding * 2,
+      textHeight + padding
+    );
+
+    // Draw border
+    ctx.strokeStyle = '#52c7ff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(
+      x - textWidth / 2 - padding,
+      y - textHeight / 2 - padding / 2,
+      textWidth + padding * 2,
+      textHeight + padding
+    );
+
+    // Draw text
+    ctx.fillStyle = '#52c7ff';
+    ctx.fillText(text, x, y);
+  };
+
+  // Helper function to draw spacing indicator between LEDs
+  const drawSpacingIndicator = (x1: number, y1: number, x2: number, y2: number, spacing: number, isVertical: boolean = false) => {
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([3, 3]);
+
+    const midX = (x1 + x2) / 2;
+    const midY = (y1 + y2) / 2;
+
+    if (isVertical) {
+      // Vertical spacing indicator
+      const offset = 25;
+      ctx.beginPath();
+      ctx.moveTo(x1 - offset, y1);
+      ctx.lineTo(x1 + offset, y1);
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x1, y2);
+      ctx.moveTo(x1 - offset, y2);
+      ctx.lineTo(x1 + offset, y2);
+      ctx.stroke();
+
+      // Draw spacing text
+      ctx.save();
+      ctx.translate(x1 - offset - 20, midY);
+      ctx.rotate(-Math.PI / 2);
+      const spacingFraction = decimalToFraction(spacing);
+      const spacingMm = spacing * 25.4;
+      drawTextWithBackground(`${spacingFraction}" / ${spacingMm.toFixed(1)}mm`, 0, 0, 12);
+      ctx.restore();
+    } else {
+      // Horizontal spacing indicator
+      const offset = 25;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1 + offset);
+      ctx.lineTo(x1, y1 - offset);
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.moveTo(x2, y2 + offset);
+      ctx.lineTo(x2, y2 - offset);
+      ctx.stroke();
+
+      // Draw spacing text
+      const spacingFraction = decimalToFraction(spacing);
+      const spacingMm = spacing * 25.4;
+      drawTextWithBackground(`${spacingFraction}" / ${spacingMm.toFixed(1)}mm`, midX, midY + offset + 20, 12);
+    }
+
+    ctx.setLineDash([]);
+  };
+
+  // Draw measurements for all sides
   const topY = offsetY + cornerSize / 2;
   const startX = offsetX + cornerSize / 2;
   const startY = offsetY + cornerSize / 2;
   const leftX = offsetX + cornerSize / 2;
+  const bottomY = offsetY + params.windowHeight * scale - cornerSize / 2;
+  const rightX = offsetX + params.windowWidth * scale - cornerSize / 2;
 
+  ctx.globalAlpha = 1;
+
+  // Top/Arch measurements (inside the frame)
+  if (params.archedTop && calculations.arch) {
+    const archPipeCut = calculations.arch.arcLength - (2 * CORNER_SIZE);
+    const archLengthFraction = decimalToFraction(archPipeCut);
+    const archLengthMm = archPipeCut * 25.4;
+    const centerX = offsetX + params.windowWidth * scale / 2;
+    const measureY = offsetY + 60;
+
+    drawTextWithBackground(
+      `${calculations.arch.numLeds} LEDs`,
+      centerX,
+      measureY,
+      14
+    );
+
+    drawTextWithBackground(
+      `Arch: ${archLengthFraction}" (${archLengthMm.toFixed(1)}mm)`,
+      centerX,
+      measureY + 30,
+      12
+    );
+
+    // Draw spacing indicator between first two LEDs on arch
+    if (calculations.arch.numLeds > 1 && ledPositions.length >= 2) {
+      const led1 = ledPositions[0];
+      const led2 = ledPositions[1];
+      drawSpacingIndicator(led1.x, led1.y, led2.x, led2.y, calculations.arch.actualSpacing);
+    }
+  } else {
+    // Top side measurement (inside)
+    const centerX = offsetX + params.windowWidth * scale / 2;
+    const measureY = topY + 50;
+    const topLengthFraction = decimalToFraction(params.windowWidth - (2 * CORNER_SIZE));
+    const topLengthMm = (params.windowWidth - (2 * CORNER_SIZE)) * 25.4;
+
+    drawTextWithBackground(
+      `${calculations.horizontal.numLeds} LEDs`,
+      centerX,
+      measureY,
+      14
+    );
+
+    drawTextWithBackground(
+      `Top: ${topLengthFraction}" (${topLengthMm.toFixed(1)}mm)`,
+      centerX,
+      measureY + 30,
+      12
+    );
+
+    // Draw spacing indicator between first two LEDs on top
+    if (calculations.horizontal.numLeds > 1 && ledPositions.length >= 2) {
+      const led1 = ledPositions[0];
+      const led2 = ledPositions[1];
+      drawSpacingIndicator(led1.x, led1.y, led2.x, led2.y, calculations.horizontal.actualSpacing);
+    }
+  }
+
+  // Bottom side measurement (inside)
+  const bottomCenterX = offsetX + params.windowWidth * scale / 2;
+  const bottomMeasureY = bottomY - 50;
+  const bottomLengthFraction = decimalToFraction(params.windowWidth - (2 * CORNER_SIZE));
+  const bottomLengthMm = (params.windowWidth - (2 * CORNER_SIZE)) * 25.4;
+
+  drawTextWithBackground(
+    `Bottom: ${bottomLengthFraction}" (${bottomLengthMm.toFixed(1)}mm)`,
+    bottomCenterX,
+    bottomMeasureY,
+    12
+  );
+
+  // Draw spacing indicator on bottom (find first two LEDs on bottom side)
   if (calculations.horizontal.numLeds > 1) {
-    ctx.strokeStyle = '#52c7ff';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([5, 5]);
-    ctx.globalAlpha = 0.8;
-
-    const y1 = topY + holeRadius + 10;
-    const y2 = y1 + 20;
-    const x1 = startX;
-    const x2 = startX + calculations.horizontal.actualSpacing * scale;
-
-    // Draw dimension line
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x1, y2);
-    ctx.moveTo(x1, (y1 + y2) / 2);
-    ctx.lineTo(x2, (y1 + y2) / 2);
-    ctx.moveTo(x2, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-
-    // Draw spacing text
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = '#52c7ff';
-    ctx.font = 'bold 12px sans-serif';
-    ctx.textAlign = 'center';
-    const horizontalMm = calculations.horizontal.actualSpacing * 25.4;
-    const horizontalFraction = decimalToFraction(calculations.horizontal.actualSpacing);
-    ctx.fillText(
-      `${horizontalFraction}"`,
-      (x1 + x2) / 2,
-      (y1 + y2) / 2 - 10
-    );
-    ctx.font = '11px sans-serif';
-    ctx.fillText(
-      `${horizontalMm.toFixed(2)}mm`,
-      (x1 + x2) / 2,
-      (y1 + y2) / 2 + 5
-    );
-
-    ctx.setLineDash([]);
+    // Find LEDs on the bottom (y coordinate close to bottomY)
+    const bottomLEDs = ledPositions.filter(led => Math.abs(led.y - bottomY) < 5);
+    if (bottomLEDs.length >= 2) {
+      drawSpacingIndicator(bottomLEDs[0].x, bottomLEDs[0].y, bottomLEDs[1].x, bottomLEDs[1].y, calculations.horizontal.actualSpacing);
+    }
   }
 
-  // Draw spacing indicators on left side
+  // Left side measurement (inside)
+  ctx.save();
+  const leftCenterY = offsetY + params.windowHeight * scale / 2;
+  const leftMeasureX = leftX + 70;
+  const leftLengthFraction = decimalToFraction(params.windowHeight - (2 * CORNER_SIZE));
+  const leftLengthMm = (params.windowHeight - (2 * CORNER_SIZE)) * 25.4;
+
+  ctx.translate(leftMeasureX, leftCenterY);
+  ctx.rotate(-Math.PI / 2);
+  drawTextWithBackground(
+    `Left: ${leftLengthFraction}" (${leftLengthMm.toFixed(1)}mm)`,
+    0,
+    0,
+    12
+  );
+  ctx.restore();
+
+  // Draw spacing indicator on left (find first two LEDs on left side)
   if (calculations.vertical.numLeds > 1) {
-    ctx.strokeStyle = '#52c7ff';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([5, 5]);
-    ctx.globalAlpha = 0.8;
-
-    const x1 = leftX - holeRadius - 10;
-    const x2 = x1 - 20;
-    const y1 = startY;
-    const y2 = startY + calculations.vertical.actualSpacing * scale;
-
-    // Draw dimension line
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y1);
-    ctx.moveTo((x1 + x2) / 2, y1);
-    ctx.lineTo((x1 + x2) / 2, y2);
-    ctx.moveTo(x1, y2);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-
-    // Draw spacing text
-    ctx.save();
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = '#52c7ff';
-    ctx.font = 'bold 12px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.translate((x1 + x2) / 2 + 5, (y1 + y2) / 2);
-    ctx.rotate(-Math.PI / 2);
-    const verticalMm = calculations.vertical.actualSpacing * 25.4;
-    const verticalFraction = decimalToFraction(calculations.vertical.actualSpacing);
-    ctx.fillText(`${verticalFraction}"`, 0, -8);
-    ctx.font = '11px sans-serif';
-    ctx.fillText(`${verticalMm.toFixed(2)}mm`, 0, 5);
-    ctx.restore();
-
-    ctx.setLineDash([]);
+    const leftLEDs = ledPositions.filter(led => Math.abs(led.x - leftX) < 5);
+    if (leftLEDs.length >= 2) {
+      // Sort by Y to get consecutive LEDs
+      leftLEDs.sort((a, b) => a.y - b.y);
+      drawSpacingIndicator(leftLEDs[0].x, leftLEDs[0].y, leftLEDs[1].x, leftLEDs[1].y, calculations.vertical.actualSpacing, true);
+    }
   }
+
+  // Right side measurement (inside)
+  ctx.save();
+  const rightCenterY = offsetY + params.windowHeight * scale / 2;
+  const rightMeasureX = rightX - 70;
+  const rightLengthFraction = decimalToFraction(params.windowHeight - (2 * CORNER_SIZE));
+  const rightLengthMm = (params.windowHeight - (2 * CORNER_SIZE)) * 25.4;
+
+  ctx.translate(rightMeasureX, rightCenterY);
+  ctx.rotate(-Math.PI / 2);
+  drawTextWithBackground(
+    `Right: ${rightLengthFraction}" (${rightLengthMm.toFixed(1)}mm)`,
+    0,
+    0,
+    12
+  );
+  ctx.restore();
 
   ctx.globalAlpha = 1;
 }
@@ -509,7 +908,12 @@ function loadSelectedConfig() {
   (document.getElementById('windowHeight') as HTMLInputElement).value = config.params.windowHeight.toString();
   (document.getElementById('idealSpacing') as HTMLInputElement).value = config.params.idealSpacing.toString();
   (document.getElementById('holeDiameter') as HTMLInputElement).value = config.params.holeDiameter.toString();
+  (document.getElementById('archedTop') as HTMLInputElement).checked = config.params.archedTop || false;
+  (document.getElementById('archHeight') as HTMLInputElement).value = (config.params.archHeight || 10).toString();
   (document.getElementById('configName') as HTMLInputElement).value = config.name;
+
+  // Toggle arch height visibility
+  toggleArchHeightInput();
 
   // Trigger update
   update();
@@ -542,7 +946,9 @@ function update() {
     windowWidth: parseFloat((document.getElementById('windowWidth') as HTMLInputElement).value),
     windowHeight: parseFloat((document.getElementById('windowHeight') as HTMLInputElement).value),
     idealSpacing: parseFloat((document.getElementById('idealSpacing') as HTMLInputElement).value),
-    holeDiameter: parseFloat((document.getElementById('holeDiameter') as HTMLInputElement).value)
+    holeDiameter: parseFloat((document.getElementById('holeDiameter') as HTMLInputElement).value),
+    archedTop: (document.getElementById('archedTop') as HTMLInputElement).checked,
+    archHeight: parseFloat((document.getElementById('archHeight') as HTMLInputElement).value)
   };
 
   currentCalculations = calculateFrame(currentParams);
@@ -565,11 +971,24 @@ function animate(timestamp: number) {
   animationId = requestAnimationFrame(animate);
 }
 
+function toggleArchHeightInput() {
+  const archedTop = (document.getElementById('archedTop') as HTMLInputElement).checked;
+  const archHeightGroup = document.getElementById('archHeightGroup');
+  if (archHeightGroup) {
+    archHeightGroup.style.display = archedTop ? 'block' : 'none';
+  }
+}
+
 // Add event listeners
 document.getElementById('windowWidth')?.addEventListener('input', update);
 document.getElementById('windowHeight')?.addEventListener('input', update);
 document.getElementById('idealSpacing')?.addEventListener('input', update);
 document.getElementById('holeDiameter')?.addEventListener('input', update);
+document.getElementById('archedTop')?.addEventListener('change', () => {
+  toggleArchHeightInput();
+  update();
+});
+document.getElementById('archHeight')?.addEventListener('input', update);
 
 // Config management event listeners
 document.getElementById('saveConfig')?.addEventListener('click', saveCurrentConfig);
